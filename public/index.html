@@ -420,7 +420,7 @@
                 <button class="btn btn-ghost" onclick="closeViewModal()">Close</button>
                 <a class="btn btn-success btn-sm" id="viewIcsLink" href="#" target="_blank">Download .ics</a>
                 <button class="btn btn-primary btn-sm" onclick="sendInvite()">Send Invite</button>
-                <button class="btn btn-danger btn-sm" onclick="deleteBookingFromView()">Delete</button>
+                <button class="btn btn-danger btn-sm" id="viewDeleteBtn" onclick="deleteBookingFromView()">Delete</button>
             </div>
         </div>
     </div>
@@ -912,6 +912,9 @@
             const typeClass = b.booking_type === "install" ? "badge-install" : b.booking_type === "training" ? "badge-training" : "badge-onboarding";
             document.getElementById("viewTitle").textContent = b.title;
             document.getElementById("viewIcsLink").href = `/api/bookings/${b.id}/ics`;
+            // Delete is allowed for managers, or the user who created the booking
+            const canModify = !!currentUser && (currentUser.role === 'manager' || b.created_by === currentUser.id);
+            document.getElementById("viewDeleteBtn").style.display = canModify ? '' : 'none';
             document.getElementById("viewBody").innerHTML = `
                 <div class="field"><div class="field-label">Type</div><div class="field-value"><span class="badge ${typeClass}">${b.booking_type}</span></div></div>
                 <div class="field"><div class="field-label">Date & Time</div><div class="field-value">${start.toLocaleDateString()} ${start.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} - ${end.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div></div>

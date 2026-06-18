@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.12.7"
+VERSION = "2.13.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -182,6 +182,13 @@ def init_db(conn):
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$;
     """)
+    # Track who created the booking (for ownership-based edit/delete)
+    cur.execute("""
+        DO $$ BEGIN
+            ALTER TABLE bookings ADD COLUMN created_by TEXT REFERENCES users(id);
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$;
+    """)
     conn.commit()
     cur.close()
 
@@ -228,6 +235,25 @@ def require_admin(f):
         g.current_user = user
         return f(*args, **kwargs)
     return decorated
+
+
+def check_booking_owner(bid):
+    """Return a Flask error response if g.current_user may not modify this
+    booking, else None. Managers may modify any booking; everyone else only
+    bookings they created."""
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT created_by FROM bookings WHERE id = %s", (bid,))
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return jsonify({"error": "Booking not found"}), 404
+    user = g.current_user
+    if user["role"] == "manager":
+        return None
+    if row[0] != user["id"]:
+        return jsonify({"error": "You can only modify bookings you created"}), 403
+    return None
 
 
 def dict_row(cursor):
@@ -884,15 +910,17 @@ def create_booking():
         """INSERT INTO bookings
         (id, title, booking_type, start_datetime, end_datetime, user_id,
          company_name, hubspot_deal_id, hubspot_company_id, deal_stage,
-         contact_name, contact_email, contact_phone, address, notes, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+         contact_name, contact_email, contact_phone, address, notes, status,
+         created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (bid, data["title"], data.get("booking_type", "install"),
          data["start_datetime"], data["end_datetime"], data["user_id"],
          data.get("company_name"), data.get("hubspot_deal_id"),
          data.get("hubspot_company_id"), data.get("deal_stage"),
          data.get("contact_name"), data.get("contact_email"),
          data.get("contact_phone"), data.get("address"),
-         data.get("notes"), data.get("status", "confirmed")),
+         data.get("notes"), data.get("status", "confirmed"),
+         g.current_user["id"]),
     )
     db.commit()
     cur.close()
@@ -1021,6 +1049,9 @@ def create_booking():
 @app.route("/api/bookings/<bid>", methods=["PUT"])
 @require_auth
 def update_booking(bid):
+    err = check_booking_owner(bid)
+    if err:
+        return err
     data = request.json
     db = get_db()
     cur = db.cursor()
@@ -1076,8 +1107,11 @@ def update_booking(bid):
 
 
 @app.route("/api/bookings/<bid>", methods=["DELETE"])
-@require_admin
+@require_auth
 def delete_booking(bid):
+    err = check_booking_owner(bid)
+    if err:
+        return err
     db = get_db()
     cur = db.cursor()
     cur.execute("DELETE FROM bookings WHERE id = %s", (bid,))
