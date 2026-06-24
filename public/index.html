@@ -912,8 +912,9 @@
             const typeClass = b.booking_type === "install" ? "badge-install" : b.booking_type === "training" ? "badge-training" : "badge-onboarding";
             document.getElementById("viewTitle").textContent = b.title;
             document.getElementById("viewIcsLink").href = `/api/bookings/${b.id}/ics`;
-            // Delete is allowed for managers, or the user who created the booking
-            const canModify = !!currentUser && (currentUser.role === 'manager' || b.created_by === currentUser.id);
+            // Delete is allowed for managers, the user who created the booking,
+            // or the OB admin (for onboarding & demo bookings).
+            const canModify = !!currentUser && (currentUser.role === 'manager' || b.created_by === currentUser.id || (currentUser.role === 'ob_admin' && (b.booking_type === 'onboarding' || b.booking_type === 'demo_setup')));
             document.getElementById("viewDeleteBtn").style.display = canModify ? '' : 'none';
             document.getElementById("viewBody").innerHTML = `
                 <div class="field"><div class="field-label">Type</div><div class="field-value"><span class="badge ${typeClass}">${b.booking_type}</span></div></div>
