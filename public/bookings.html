@@ -846,8 +846,9 @@
             document.getElementById("viewIcsLink").href = `/api/bookings/${b.id}/ics`;
             const isOnboarding = (b.booking_type === 'onboarding');
             const status = b.status || 'confirmed';
-            // Edit/delete is allowed for managers, or the user who created the booking
-            const canModify = !!currentUser && (currentUser.role === 'manager' || b.created_by === currentUser.id);
+            // Edit/delete is allowed for managers, the user who created the booking,
+            // or the OB admin (for onboarding & demo bookings, so they can reassign).
+            const canModify = !!currentUser && (currentUser.role === 'manager' || b.created_by === currentUser.id || (currentUser.role === 'ob_admin' && (b.booking_type === 'onboarding' || b.booking_type === 'demo_setup')));
             const statusClass = status === 'cancelled' ? 'badge-cancelled'
                 : status === 'completed' ? 'badge-completed'
                 : status === 'prep_complete' ? 'badge-prep_complete'

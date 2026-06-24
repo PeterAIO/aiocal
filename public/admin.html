@@ -351,6 +351,7 @@
                     <select id="userRole">
                         <option value="deployment_specialist">Deployment Specialist</option>
                         <option value="manager">Manager</option>
+                        <option value="ob_admin">OB Admin</option>
                         <option value="aio_buddy">AIO Buddy</option>
                         <option value="sales_rep">Sales Rep</option>
                     </select>
@@ -435,7 +436,7 @@
         }
 
         function formatRole(role) {
-            const map = { deployment_specialist: 'Deployment Specialist', manager: 'Manager', aio_buddy: 'AIO Buddy', sales_rep: 'Sales Rep', installer: 'Installer', trainer: 'Trainer', lead: 'Lead' };
+            const map = { deployment_specialist: 'Deployment Specialist', manager: 'Manager', ob_admin: 'OB Admin', aio_buddy: 'AIO Buddy', sales_rep: 'Sales Rep', installer: 'Installer', trainer: 'Trainer', lead: 'Lead' };
             return map[role] || role;
         }
 

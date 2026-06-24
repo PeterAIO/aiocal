@@ -239,17 +239,20 @@ def require_admin(f):
 
 def check_booking_owner(bid):
     """Return a Flask error response if g.current_user may not modify this
-    booking, else None. Managers may modify any booking; everyone else only
-    bookings they created."""
+    booking, else None. Managers may modify any booking; the OB admin may modify
+    any onboarding or demo_setup booking (so they can reassign to an AIO buddy);
+    everyone else only bookings they created."""
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT created_by FROM bookings WHERE id = %s", (bid,))
+    cur.execute("SELECT created_by, booking_type FROM bookings WHERE id = %s", (bid,))
     row = cur.fetchone()
     cur.close()
     if row is None:
         return jsonify({"error": "Booking not found"}), 404
     user = g.current_user
     if user["role"] == "manager":
+        return None
+    if user["role"] == "ob_admin" and row[1] in ("onboarding", "demo_setup"):
         return None
     if row[0] != user["id"]:
         return jsonify({"error": "You can only modify bookings you created"}), 403
@@ -694,48 +697,12 @@ def delete_timeoff(uid, tid):
 
 def _roles_for_booking_type(booking_type):
     """Map booking type to allowed user roles."""
-    if booking_type == "onboarding":
-        return ["aio_buddy"]
-    if booking_type == "demo_setup":
-        return ["demo"]
+    # OB calls and Demos both funnel to the OB admin, who then reassigns them
+    # to an AIO buddy.
+    if booking_type in ("onboarding", "demo_setup"):
+        return ["ob_admin"]
     # Default = deployment
     return ["deployment_specialist", "installer", "trainer", "lead"]
-
-
-DEMO_USER_EMAIL = "waleed.sulehri@aioapp.com"
-
-
-def _get_or_create_demo_user(db):
-    """Find or create the dedicated Demo Setup user (Waleed). Always returns a row."""
-    cur = db.cursor()
-    cur.execute("SELECT id, name, email, role, color FROM users WHERE LOWER(email) = LOWER(%s)", (DEMO_USER_EMAIL,))
-    row = dict_one(cur)
-    if row:
-        cur.close()
-        # Make sure role is 'demo' so role-based filters keep him isolated
-        if row.get("role") != "demo":
-            cur2 = db.cursor()
-            cur2.execute("UPDATE users SET role = 'demo', active = 1 WHERE id = %s", (row["id"],))
-            db.commit()
-            cur2.close()
-            row["role"] = "demo"
-        return row
-
-    # Create the user with full-week availability 09:00-17:00 PT
-    new_id = str(uuid.uuid4())
-    cur.execute("""
-        INSERT INTO users (id, name, email, role, color, active, password_hash)
-        VALUES (%s, %s, %s, 'demo', '#f59e0b', 1, '')
-    """, (new_id, "Waleed Sulehri", DEMO_USER_EMAIL))
-    # Mon..Fri availability
-    for dow in range(0, 5):
-        cur.execute("""
-            INSERT INTO availability (user_id, day_of_week, start_time, end_time)
-            VALUES (%s, %s, '09:00', '17:00')
-        """, (new_id, dow))
-    db.commit()
-    cur.close()
-    return {"id": new_id, "name": "Waleed Sulehri", "email": DEMO_USER_EMAIL, "role": "demo", "color": "#f59e0b"}
 
 
 @app.route("/api/available-days")
@@ -744,9 +711,6 @@ def available_days():
     """Return which days of week (0=Mon..6=Sun) have at least one available user."""
     booking_type = request.args.get("booking_type", "install")
     db = get_db()
-    # Make sure the demo user exists when demo_setup is requested
-    if booking_type == "demo_setup":
-        _get_or_create_demo_user(db)
     roles = _roles_for_booking_type(booking_type)
     cur = db.cursor()
     placeholders = ",".join(["%s"] * len(roles))
@@ -774,9 +738,6 @@ def round_robin():
     dow = target_date.weekday()  # Mon=0..Sun=6
 
     db = get_db()
-    # Make sure demo user exists for demo_setup bookings
-    if booking_type == "demo_setup":
-        _get_or_create_demo_user(db)
     roles = _roles_for_booking_type(booking_type)
     cur = db.cursor()
 
