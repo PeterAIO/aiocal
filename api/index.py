@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.14.0"
+VERSION = "2.14.1"
 
 
 def local_dt_to_ms(dt_naive):
@@ -842,7 +842,9 @@ def list_bookings():
     start = request.args.get("start")
     end = request.args.get("end")
     user_id = request.args.get("user_id")
-    query = "SELECT b.*, u.name as user_name, u.color as user_color FROM bookings b JOIN users u ON b.user_id = u.id WHERE 1=1"
+    query = ("SELECT b.*, u.name as user_name, u.color as user_color, c.name as created_by_name "
+              "FROM bookings b JOIN users u ON b.user_id = u.id "
+              "LEFT JOIN users c ON b.created_by = c.id WHERE 1=1")
     params = []
     if start:
         query += " AND b.end_datetime >= %s"

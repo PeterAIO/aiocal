@@ -239,6 +239,13 @@
                     <option value="cancelled">Cancelled</option>
                 </select>
             </div>
+            <div class="filter-group">
+                <label>Sort By</label>
+                <select id="sortBy" onchange="renderTable(allBookings)">
+                    <option value="start">Start time</option>
+                    <option value="created">Recently added</option>
+                </select>
+            </div>
             <button class="btn btn-primary" onclick="loadBookings()">Filter</button>
             <button class="btn btn-ghost" onclick="clearFilters()">Clear</button>
         </div>
@@ -797,6 +804,13 @@
             const deployedSection = document.getElementById("deployedSection");
             const deployedContainer = document.getElementById("deployedTable");
             const statusFilter = document.getElementById("filterStatus").value;
+            const sortBy = document.getElementById("sortBy").value;
+
+            bookings = bookings.slice().sort(function(a, b) {
+                return sortBy === 'created'
+                    ? new Date(b.created_at) - new Date(a.created_at)
+                    : new Date(a.start_datetime) - new Date(b.start_datetime);
+            });
 
             // Split into active (confirmed/cancelled) and deployed (completed)
             const active = bookings.filter(b => b.status !== 'completed');
@@ -900,6 +914,7 @@
             document.getElementById("viewBody").innerHTML = `
                 <div class="field"><div class="field-label">Status</div><div class="field-value"><span class="badge ${statusClass}">${statusLabel}</span></div></div>
                 <div class="field"><div class="field-label">Date & Time</div><div class="field-value">${start.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} | Start: ${start.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} - ${end.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div></div>
+                <div class="field"><div class="field-label">Booked By</div><div class="field-value">${b.created_by_name || 'Unknown'}${b.created_at ? ' on ' + new Date(b.created_at).toLocaleString([], {dateStyle:'medium', timeStyle:'short'}) : ''}</div></div>
                 ${canModify ? `<div class="field"><div class="field-label">Assigned To</div><div class="field-value" style="display:flex;align-items:center;gap:8px;">
                     <select id="reassignSelect" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;font-family:inherit;">
                         <option value="">Unassigned</option>
