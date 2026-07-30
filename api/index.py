@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.14.1"
+VERSION = "2.15.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -240,7 +240,7 @@ def require_admin(f):
 def check_booking_owner(bid):
     """Return a Flask error response if g.current_user may not modify this
     booking, else None. Managers may modify any booking; the OB admin may modify
-    any onboarding or demo_setup booking (so they can reassign to an AIO buddy);
+    any onboarding booking (so they can reassign to an AIO buddy);
     everyone else only bookings they created."""
     db = get_db()
     cur = db.cursor()
@@ -252,7 +252,7 @@ def check_booking_owner(bid):
     user = g.current_user
     if user["role"] == "manager":
         return None
-    if user["role"] == "ob_admin" and row[1] in ("onboarding", "demo_setup"):
+    if user["role"] == "ob_admin" and row[1] == "onboarding":
         return None
     if row[0] != user["id"]:
         return jsonify({"error": "You can only modify bookings you created"}), 403
@@ -696,13 +696,51 @@ def delete_timeoff(uid, tid):
 # ── Round Robin Assignment ─────────��─────────────────────────────────────────
 
 def _roles_for_booking_type(booking_type):
-    """Map booking type to allowed user roles."""
-    # OB calls and Demos both funnel to the OB admin, who then reassigns them
-    # to an AIO buddy.
-    if booking_type in ("onboarding", "demo_setup"):
-        return ["ob_admin"]
+    """Map booking type to role tiers, tried in order until one has an
+    available user."""
+    # OB calls funnel to the OB admin, who then reassigns them to an AIO buddy.
+    if booking_type == "onboarding":
+        return [["ob_admin"]]
+    # Demos go to the dedicated Demo Setup person; if they're unavailable,
+    # fall back to the deployment team.
+    if booking_type == "demo_setup":
+        return [["demo_setup"], ["deployment_specialist", "installer", "trainer", "lead"]]
     # Default = deployment
-    return ["deployment_specialist", "installer", "trainer", "lead"]
+    return [["deployment_specialist", "installer", "trainer", "lead"]]
+
+
+def _has_free_demo_hour(db, uid, dow, date_str, next_date):
+    """True if the user has at least one unbooked 1-hour demo slot left in
+    their availability window on this date (mirrors the slot list the
+    frontend builds)."""
+    cur = db.cursor()
+    cur.execute("""
+        SELECT start_time, end_time FROM availability
+        WHERE user_id = %s AND day_of_week = %s
+    """, (uid, dow))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        return False
+    try:
+        start_h = int(str(row[0]).split(":")[0])
+        end_h = int(str(row[1]).split(":")[0])
+    except Exception:
+        start_h, end_h = 7, 19
+    cur.execute("""
+        SELECT start_datetime FROM bookings
+        WHERE user_id = %s AND start_datetime >= %s AND start_datetime < %s
+          AND status != 'cancelled' AND booking_type = 'demo_setup'
+    """, (uid, date_str, next_date))
+    booked = set()
+    for r in cur.fetchall():
+        try:
+            sdt = r[0] if isinstance(r[0], datetime) else datetime.fromisoformat(str(r[0]))
+            booked.add(sdt.hour)
+        except Exception:
+            pass
+    cur.close()
+    return any(h not in booked for h in range(start_h, end_h))
 
 
 @app.route("/api/available-days")
@@ -711,7 +749,7 @@ def available_days():
     """Return which days of week (0=Mon..6=Sun) have at least one available user."""
     booking_type = request.args.get("booking_type", "install")
     db = get_db()
-    roles = _roles_for_booking_type(booking_type)
+    roles = [r for tier in _roles_for_booking_type(booking_type) for r in tier]
     cur = db.cursor()
     placeholders = ",".join(["%s"] * len(roles))
     cur.execute(f"""
@@ -738,49 +776,52 @@ def round_robin():
     dow = target_date.weekday()  # Mon=0..Sun=6
 
     db = get_db()
-    roles = _roles_for_booking_type(booking_type)
+    role_tiers = _roles_for_booking_type(booking_type)
     cur = db.cursor()
 
-    # Get active users who have availability on this day of week and a matching role
-    placeholders = ",".join(["%s"] * len(roles))
-    cur.execute(f"""
-        SELECT u.id, u.name, u.email, u.role, u.color
-        FROM users u
-        JOIN availability a ON a.user_id = u.id AND a.day_of_week = %s
-        WHERE u.active = 1 AND u.role IN ({placeholders})
-    """, (dow, *roles))
-    available_users = dict_row(cur)
-
-    if not available_users:
-        cur.close()
-        return jsonify({"user": None})
-
-    # Exclude users on time off for this date
+    # Users on time off for this date are excluded from every tier
     cur.execute("""
         SELECT DISTINCT user_id FROM time_off
         WHERE start_date <= %s AND end_date >= %s
     """, (date_str, date_str))
     off_ids = {row[0] for row in cur.fetchall()}
-    available_users = [u for u in available_users if u["id"] not in off_ids]
+
+    next_date = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Try each role tier in order (demos fall back to the deployment team
+    # when the Demo Setup person is unavailable).
+    available_users = []
+    for roles in role_tiers:
+        # Get active users who have availability on this day of week and a matching role
+        placeholders = ",".join(["%s"] * len(roles))
+        cur.execute(f"""
+            SELECT u.id, u.name, u.email, u.role, u.color
+            FROM users u
+            JOIN availability a ON a.user_id = u.id AND a.day_of_week = %s
+            WHERE u.active = 1 AND u.role IN ({placeholders})
+        """, (dow, *roles))
+        candidates = [u for u in dict_row(cur) if u["id"] not in off_ids]
+
+        # Deployments block the whole day; onboarding & demo setup only block their own 1-hour slot.
+        if booking_type not in ("onboarding", "demo_setup"):
+            cur.execute("""
+                SELECT DISTINCT user_id FROM bookings
+                WHERE start_datetime >= %s AND start_datetime < %s
+                  AND status != 'cancelled'
+            """, (date_str, next_date))
+            booked_ids = {row[0] for row in cur.fetchall()}
+            candidates = [u for u in candidates if u["id"] not in booked_ids]
+        elif booking_type == "demo_setup":
+            # A candidate whose slots are all taken counts as unavailable
+            candidates = [u for u in candidates if _has_free_demo_hour(db, u["id"], dow, date_str, next_date)]
+
+        if candidates:
+            available_users = candidates
+            break
 
     if not available_users:
         cur.close()
         return jsonify({"user": None})
-
-    # Deployments block the whole day; onboarding & demo setup only block their own 1-hour slot.
-    next_date = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    if booking_type not in ("onboarding", "demo_setup"):
-        cur.execute("""
-            SELECT DISTINCT user_id FROM bookings
-            WHERE start_datetime >= %s AND start_datetime < %s
-              AND status != 'cancelled'
-        """, (date_str, next_date))
-        booked_ids = {row[0] for row in cur.fetchall()}
-        available_users = [u for u in available_users if u["id"] not in booked_ids]
-
-        if not available_users:
-            cur.close()
-            return jsonify({"user": None})
 
     # Round robin: pick user with fewest total bookings
     remaining_ids = [u["id"] for u in available_users]
