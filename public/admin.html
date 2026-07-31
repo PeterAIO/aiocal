@@ -386,8 +386,8 @@
                 if (!authRes.ok) { window.location.href = "/login"; return; }
                 const authData = await authRes.json();
                 if (!authData.user) { window.location.href = "/login"; return; }
-                if (authData.user.role !== "manager") {
-                    alert("Admin access restricted to Managers only.");
+                if (authData.user.role !== "manager" && authData.user.role !== "ob_admin") {
+                    alert("Admin access restricted to Managers and OB Admins only.");
                     window.location.href = "/";
                     return;
                 }

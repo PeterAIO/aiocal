@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -230,7 +230,7 @@ def require_admin(f):
         user = get_current_user()
         if not user:
             return jsonify({"error": "Not authenticated"}), 401
-        if user["role"] != "manager":
+        if user["role"] not in ("manager", "ob_admin"):
             return jsonify({"error": "Admin access required"}), 403
         g.current_user = user
         return f(*args, **kwargs)
@@ -239,20 +239,17 @@ def require_admin(f):
 
 def check_booking_owner(bid):
     """Return a Flask error response if g.current_user may not modify this
-    booking, else None. Managers may modify any booking; the OB admin may modify
-    any onboarding booking (so they can reassign to an AIO buddy);
+    booking, else None. Managers and the OB admin may modify any booking;
     everyone else only bookings they created."""
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT created_by, booking_type FROM bookings WHERE id = %s", (bid,))
+    cur.execute("SELECT created_by FROM bookings WHERE id = %s", (bid,))
     row = cur.fetchone()
     cur.close()
     if row is None:
         return jsonify({"error": "Booking not found"}), 404
     user = g.current_user
-    if user["role"] == "manager":
-        return None
-    if user["role"] == "ob_admin" and row[1] == "onboarding":
+    if user["role"] in ("manager", "ob_admin"):
         return None
     if row[0] != user["id"]:
         return jsonify({"error": "You can only modify bookings you created"}), 403
