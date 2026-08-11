@@ -27,6 +27,15 @@ Two backend implementations exist — **`api/index.py` is the live production ap
 
 **HubSpot sync:** On booking create/complete/sign-off, the app posts HTML notes to the associated deal (assoc type 214) and company (assoc type 190), @mentions the specialist/booker/admin, and PATCHes date properties: deployments → `install_date_new` (deal) + `migrated_00npw00000fv4pz2ad` (company); onboarding → `on_boarding_call`; demo → `demo_request_date` (company). Completion/sign-off sets company `migrated_00nfi000003lzy1uac = "Active"` (Deployed). Deal stage IDs of interest are in the `DEAL_STAGES` dict. Times are interpreted as `America/Los_Angeles` and converted to UTC ms via `local_dt_to_ms()`.
 
+**Metrics feed:** `GET /api/metrics?from=&to=` (dates `YYYY-MM-DD`, both inclusive) returns
+booking aggregates — per-type stage counts, the onboarding funnel, lead-time percentiles,
+per-assignee load and a monthly series — for the executive dashboard. Guarded by the
+`X-Metrics-Key` header (`require_metrics_key`), **not** the session auth used by the UI.
+Aggregates only, deliberately: `bookings` holds customer PII that need not leave this app.
+Stage counts derive from the timestamp columns rather than `status`, since `status` holds
+only the current stage. Caveat: cancellations are hard-deleted and there is no `cancelled`
+status, so cancel/reschedule rates are not derivable.
+
 **Onboarding workflow (3 stages):** (1) booking created → `confirmed`; (2) customer opens a tokenized public link (`/onboarding/<token>`), submits the pre-call form → `prep_complete`; (3) AIO Buddy submits the sign-off form after the call → `completed`. Public (no-auth) endpoints `GET/POST /api/public/onboarding/<token>` serve the customer form.
 
 ## Key Files & Entry Points
@@ -65,6 +74,9 @@ flask --app api/index run          # not verified in-repo; api/index.py is built
 - `DATABASE_URL` — Postgres connection string (connected with `sslmode="require"`).
 - `HUBSPOT_ACCESS_TOKEN` — HubSpot private app token (HubSpot features no-op if unset).
 - `SENDGRID_API_KEY`, `EMAIL_FROM`, `ADMIN_EMAIL` — email sending (no-op if unset).
+- `METRICS_KEY` — shared secret for `GET /api/metrics`, the read-only aggregate feed
+  consumed by the executive dashboard. **Unset = the endpoint 401s everything** (fails
+  closed), so it is safe to leave unconfigured.
 - `VERCEL` — set automatically on Vercel; in `app.py` it switches the SQLite path to `/tmp`.
 - (`app.py` only) `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`.
 
