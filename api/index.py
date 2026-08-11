@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.16.0"
+VERSION = "2.17.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -41,6 +41,10 @@ HUBSPOT_API_KEY = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+
+# Shared secret for the read-only /api/metrics pull (executive dashboard).
+# Unset = endpoint refuses every request.
+METRICS_KEY = os.environ.get("METRICS_KEY", "")
 
 DEAL_STAGES = {
     "2986384063": "Install/Training",
@@ -1854,3 +1858,143 @@ def send_invite(bid):
         return jsonify({"message": "Booking email sent to team"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── Metrics API ───────────────────────────────────────────────────────────────
+# Read-only aggregate feed for the executive dashboard. Aggregates only: the
+# bookings table holds customer names, emails, phones and addresses, and none of
+# that needs to leave this app to render a count.
+
+def require_metrics_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        key = request.headers.get("X-Metrics-Key", "")
+        # Fail closed — an unset METRICS_KEY means the endpoint is off, not open.
+        if not METRICS_KEY or not secrets.compare_digest(key, METRICS_KEY):
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+METRIC_BOOKING_TYPES = ("install", "onboarding", "demo_setup")
+
+
+def _num(v, places=1):
+    """psycopg2 hands back Decimal for numeric aggregates, which jsonify can't
+    serialize."""
+    return None if v is None else round(float(v), places)
+
+
+@app.route("/api/metrics")
+@require_metrics_key
+def metrics():
+    """Booking aggregates over a date range.
+
+    `from` and `to` are YYYY-MM-DD and both are inclusive — `to` covers its
+    whole day. Counts reflect bookings currently on the calendar; cancellations
+    are hard-deleted, so this cannot report cancel or reschedule rates.
+    """
+    try:
+        d_from = datetime.strptime((request.args.get("from") or "").strip(), "%Y-%m-%d").date()
+        d_to = datetime.strptime((request.args.get("to") or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "from and to are required, as YYYY-MM-DD"}), 400
+    if d_from > d_to:
+        return jsonify({"error": "from must not be after to"}), 400
+
+    # start_datetime is TEXT ('2026-03-04T09:00'), so range-compare against an
+    # exclusive bound one day past `to` rather than trying to match a time.
+    span = {"start": d_from.isoformat(), "end": (d_to + timedelta(days=1)).isoformat()}
+
+    db = get_db()
+    cur = db.cursor()
+
+    # Stage counts key off the timestamp columns rather than `status`, because
+    # status holds only the *current* stage: a completed booking no longer reads
+    # as prep_complete, which would make the funnel non-monotonic.
+    cur.execute("""
+        SELECT booking_type,
+               COUNT(*)                                                       AS booked,
+               COUNT(*) FILTER (WHERE customer_form_submitted_at IS NOT NULL) AS prep_complete,
+               COUNT(*) FILTER (WHERE status = 'completed')                   AS completed,
+               COUNT(*) FILTER (WHERE signoff_submitted_at IS NOT NULL)       AS signed_off
+        FROM bookings
+        WHERE start_datetime >= %(start)s AND start_datetime < %(end)s
+        GROUP BY booking_type
+    """, span)
+    by_type = {r["booking_type"]: r for r in dict_row(cur)}
+
+    bookings = {}
+    for t in METRIC_BOOKING_TYPES:
+        r = by_type.get(t) or {}
+        bookings[t] = {
+            "booked": r.get("booked", 0),
+            "prepComplete": r.get("prep_complete", 0),
+            "completed": r.get("completed", 0),
+            "signedOff": r.get("signed_off", 0),
+        }
+
+    ob = bookings["onboarding"]
+    onboarding_funnel = {
+        "confirmed": ob["booked"],
+        "prepComplete": ob["prepComplete"],
+        "completed": ob["completed"],
+        "formCompletionRate": _num(ob["prepComplete"] / ob["booked"], 2) if ob["booked"] else None,
+    }
+
+    # Lead time: how far ahead we're booking. created_at is server time while
+    # start_datetime is Pacific, so this carries a few hours of skew — immaterial
+    # for a median measured in days. Clamped at 0 for retroactively logged jobs.
+    cur.execute("""
+        SELECT booking_type,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d) AS median,
+               PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY d) AS p90
+        FROM (
+            SELECT booking_type,
+                   GREATEST(EXTRACT(EPOCH FROM (start_datetime::timestamp - created_at)) / 86400.0, 0) AS d
+            FROM bookings
+            WHERE start_datetime >= %(start)s AND start_datetime < %(end)s
+        ) t
+        GROUP BY booking_type
+    """, span)
+    lead = {r["booking_type"]: {"median": _num(r["median"]), "p90": _num(r["p90"])} for r in dict_row(cur)}
+
+    cur.execute("""
+        SELECT u.id, u.name, u.role,
+               COUNT(*)                                      AS booked,
+               COUNT(*) FILTER (WHERE b.status = 'completed') AS completed
+        FROM bookings b JOIN users u ON u.id = b.user_id
+        WHERE b.start_datetime >= %(start)s AND b.start_datetime < %(end)s
+        GROUP BY u.id, u.name, u.role
+        ORDER BY booked DESC
+    """, span)
+    capacity = [
+        {"userId": r["id"], "name": r["name"], "role": r["role"],
+         "booked": r["booked"], "completed": r["completed"]}
+        for r in dict_row(cur)
+    ]
+
+    cur.execute("""
+        SELECT SUBSTRING(start_datetime FROM 1 FOR 7) AS month, booking_type, COUNT(*) AS n
+        FROM bookings
+        WHERE start_datetime >= %(start)s AND start_datetime < %(end)s
+        GROUP BY SUBSTRING(start_datetime FROM 1 FOR 7), booking_type
+        ORDER BY month
+    """, span)
+    buckets = {}
+    for r in dict_row(cur):
+        row = buckets.setdefault(r["month"], {"month": r["month"], **{t: 0 for t in METRIC_BOOKING_TYPES}})
+        if r["booking_type"] in row:
+            row[r["booking_type"]] = r["n"]
+    monthly = [buckets[k] for k in sorted(buckets)]
+
+    cur.close()
+    return jsonify({
+        "generatedAt": datetime.utcnow().isoformat() + "Z",
+        "period": {"from": d_from.isoformat(), "to": d_to.isoformat()},
+        "bookings": bookings,
+        "onboardingFunnel": onboarding_funnel,
+        "leadTimeDays": lead,
+        "capacity": capacity,
+        "monthly": monthly,
+    })

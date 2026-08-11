@@ -115,6 +115,13 @@
         // Changelog — newest first. Update this list with each release.
         const CHANGELOG = [
             {
+                version: "2.17.0",
+                date: "2026-08-11",
+                changes: [
+                    { tag: "feature", text: "New read-only metrics feed (GET /api/metrics) so the executive dashboard can report on booking volumes, the onboarding funnel, how far ahead we're booking, and per-specialist load. It returns aggregate counts only — no customer names, emails, phone numbers or addresses leave this app — and is protected by its own key, separate from the login used by the site. Nothing in the booking UI changes." },
+                ],
+            },
+            {
                 version: "2.16.0",
                 date: "2026-07-31",
                 changes: [
