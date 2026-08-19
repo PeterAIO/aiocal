@@ -256,6 +256,7 @@
             <div class="tab active" onclick="switchTab('users')">Team Members</div>
             <div class="tab" onclick="switchTab('availability')">Availability</div>
             <div class="tab" onclick="switchTab('timeoff')">Time Off</div>
+            <div class="tab" onclick="switchTab('activity')">Activity</div>
         </div>
 
         <!-- USERS TAB -->
@@ -324,6 +325,26 @@
                         <button class="btn btn-primary" onclick="addTimeOff()" style="height:36px;">Add</button>
                     </div>
                     <div id="timeoffList"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ACTIVITY TAB -->
+        <div class="tab-content" id="tab-activity">
+            <div class="section">
+                <div class="section-header">
+                    <h2>Recent Activity</h2>
+                    <button class="btn btn-ghost btn-sm" onclick="loadActivity()">Refresh</button>
+                </div>
+                <div class="section-body" style="padding:0;">
+                    <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr>
+                        </thead>
+                        <tbody id="activityTableBody"></tbody>
+                    </table>
+                    </div>
                 </div>
             </div>
         </div>
@@ -415,6 +436,7 @@
 
             if (name === "availability") loadAvailability();
             if (name === "timeoff") loadTimeOff();
+            if (name === "activity") loadActivity();
         }
 
         async function loadHubspotOwners() {
@@ -695,6 +717,51 @@
         async function removeTimeOff(uid, tid) {
             await fetch(`/api/users/${uid}/timeoff/${tid}`, { method: "DELETE" });
             loadTimeOff();
+        }
+
+        // ── Activity ──
+
+        const ACTIVITY_LABELS = {
+            login: "Logged in",
+            login_failed: "Failed login",
+            logout: "Logged out",
+            booking_created: "Booking created",
+            booking_updated: "Booking updated",
+            booking_cancelled: "Booking cancelled",
+            booking_deleted: "Booking deleted",
+            deployment_completed: "Deployment completed",
+            onboarding_signed_off: "Onboarding signed off",
+            customer_form_submitted: "Customer form submitted",
+            form_link_emailed: "Form link emailed",
+            stage_reset: "Stage reset",
+            user_created: "Member added",
+            user_updated: "Member updated",
+            user_removed: "Member removed",
+            password_set: "Password set",
+        };
+
+        function esc(s) {
+            const d = document.createElement("div");
+            d.textContent = s == null ? "" : s;
+            return d.innerHTML;
+        }
+
+        async function loadActivity() {
+            const res = await fetch("/api/activity");
+            const items = await res.json();
+            const tbody = document.getElementById("activityTableBody");
+            if (!items.length) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:24px;">No activity recorded yet.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = items.map(a => `
+                <tr>
+                    <td style="white-space:nowrap;">${new Date(a.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</td>
+                    <td>${esc(a.user_name) || '<span style="color:var(--text-muted);">&mdash;</span>'}</td>
+                    <td style="white-space:nowrap;">${esc(ACTIVITY_LABELS[a.action] || a.action)}</td>
+                    <td>${esc(a.details)}</td>
+                </tr>
+            `).join("");
         }
 
         // Init availability grid immediately

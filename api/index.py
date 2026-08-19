@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -131,6 +131,19 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    """)
+    # Admin-visible activity feed. user_name is a snapshot so entries survive
+    # renames/deactivation; user_id/user_name are NULL for anonymous actions
+    # (failed logins, customer form submissions).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            user_name TEXT,
+            action TEXT NOT NULL,
+            details TEXT,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
     """)
@@ -260,6 +273,21 @@ def check_booking_owner(bid):
     return None
 
 
+def log_activity(action, details, user=None):
+    """Record an entry in the admin activity log. Never fails the request."""
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO activity_log (id, user_id, user_name, action, details) VALUES (%s, %s, %s, %s, %s)",
+            (str(uuid.uuid4()), user["id"] if user else None, user["name"] if user else None, action, details),
+        )
+        db.commit()
+        cur.close()
+    except Exception:
+        pass
+
+
 def dict_row(cursor):
     """Convert cursor results to list of dicts."""
     columns = [desc[0] for desc in cursor.description]
@@ -296,6 +324,7 @@ def login():
     row = cur.fetchone()
     if not row:
         cur.close()
+        log_activity("login_failed", email)
         return jsonify({"error": "Invalid email or password"}), 401
 
     columns = ["id", "name", "email", "role", "color", "password_hash"]
@@ -303,16 +332,19 @@ def login():
 
     if not user["password_hash"]:
         cur.close()
+        log_activity("login_failed", email)
         return jsonify({"error": "Password not set. Ask an admin to set your password."}), 401
 
     if user["password_hash"] != hash_password(password):
         cur.close()
+        log_activity("login_failed", email)
         return jsonify({"error": "Invalid email or password"}), 401
 
     token = secrets.token_hex(32)
     cur.execute("INSERT INTO sessions (token, user_id) VALUES (%s, %s)", (token, user["id"]))
     db.commit()
     cur.close()
+    log_activity("login", user["email"], user)
 
     resp = jsonify({"user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "color": user["color"]}, "token": token})
     resp.set_cookie("session_token", token, httponly=True, samesite="Lax", max_age=60*60*24*30)
@@ -323,11 +355,14 @@ def login():
 def logout():
     token = request.cookies.get("session_token") or request.headers.get("X-Session-Token")
     if token:
+        user = get_current_user()
         db = get_db()
         cur = db.cursor()
         cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
         db.commit()
         cur.close()
+        if user:
+            log_activity("logout", user["email"], user)
     resp = jsonify({"ok": True})
     resp.delete_cookie("session_token")
     return resp
@@ -396,7 +431,10 @@ def set_user_password(uid):
     cur = db.cursor()
     cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(password), uid))
     db.commit()
+    cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
+    target = cur.fetchone()
     cur.close()
+    log_activity("password_set", f"for {target[0]}" if target else uid, g.current_user)
     return jsonify({"ok": True})
 
 
@@ -595,6 +633,7 @@ def create_user():
     )
     db.commit()
     cur.close()
+    log_activity("user_created", f"{data['name']} ({data['email']})", g.current_user)
     return jsonify({"id": uid}), 201
 
 
@@ -610,6 +649,7 @@ def update_user(uid):
     )
     db.commit()
     cur.close()
+    log_activity("user_updated", f"{data['name']} ({data['email']})", g.current_user)
     return jsonify({"ok": True})
 
 
@@ -618,9 +658,12 @@ def update_user(uid):
 def delete_user(uid):
     db = get_db()
     cur = db.cursor()
+    cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
+    target = cur.fetchone()
     cur.execute("UPDATE users SET active = 0 WHERE id = %s", (uid,))
     db.commit()
     cur.close()
+    log_activity("user_removed", target[0] if target else uid, g.current_user)
     return jsonify({"ok": True})
 
 
@@ -929,6 +972,7 @@ def create_booking():
     )
     db.commit()
     cur.close()
+    log_activity("booking_created", f"{data['title']} ({data.get('booking_type', 'install')}) on {data['start_datetime'][:10]}", g.current_user)
 
     result = {"id": bid, "hubspot_note": None, "email_sent": None}
 
@@ -1076,6 +1120,8 @@ def update_booking(bid):
     )
     db.commit()
     cur.close()
+    action = "booking_cancelled" if data.get("status") == "cancelled" else "booking_updated"
+    log_activity(action, f"{data['title']} ({data.get('booking_type', 'install')}) on {data['start_datetime'][:10]}", g.current_user)
 
     result = {"ok": True}
 
@@ -1119,9 +1165,13 @@ def delete_booking(bid):
         return err
     db = get_db()
     cur = db.cursor()
+    cur.execute("SELECT title, booking_type, start_datetime FROM bookings WHERE id = %s", (bid,))
+    row = cur.fetchone()
     cur.execute("DELETE FROM bookings WHERE id = %s", (bid,))
     db.commit()
     cur.close()
+    if row:
+        log_activity("booking_deleted", f"{row[0]} ({row[1]}) on {row[2][:10]}", g.current_user)
     return jsonify({"ok": True})
 
 
@@ -1145,6 +1195,7 @@ def complete_booking(bid):
     cur.execute("UPDATE bookings SET status = 'completed' WHERE id = %s", (bid,))
     db.commit()
     cur.close()
+    log_activity("deployment_completed", f"{booking['title']} ({booking.get('company_name') or 'no company'})", g.current_user)
 
     result = {"ok": True}
 
@@ -1367,6 +1418,7 @@ def email_customer_link(bid):
     except Exception as e:
         return jsonify({"error": f"Email failed: {str(e)}"}), 500
 
+    log_activity("form_link_emailed", f"{booking.get('company_name') or booking['title']} to {booking['contact_email']}", g.current_user)
     return jsonify({"ok": True, "url": link})
 
 
@@ -1421,6 +1473,7 @@ def public_onboarding_submit(token):
     """, (json.dumps(data), booking["id"]))
     db.commit()
     cur.close()
+    log_activity("customer_form_submitted", f"{booking.get('company_name') or booking['title']} (pre-call form)")
 
     bid = booking["id"]
     result = {"ok": True}
@@ -1570,7 +1623,11 @@ def reset_booking_stage(bid):
         WHERE id = %s
     """, (bid,))
     db.commit()
+    cur.execute("SELECT title, company_name FROM bookings WHERE id = %s", (bid,))
+    row = cur.fetchone()
     cur.close()
+    if row:
+        log_activity("stage_reset", row[1] or row[0], g.current_user)
     return jsonify({"ok": True, "status": "confirmed"})
 
 
@@ -1606,6 +1663,7 @@ def submit_signoff(bid):
     """, (json.dumps(data), bid))
     db.commit()
     cur.close()
+    log_activity("onboarding_signed_off", booking.get("company_name") or booking["title"], g.current_user)
 
     result = {"ok": True}
 
@@ -1858,6 +1916,22 @@ def send_invite(bid):
         return jsonify({"message": "Booking email sent to team"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── Activity Log API ──────────────────────────────────────────────────────────
+
+@app.route("/api/activity")
+@require_admin
+def list_activity():
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("""
+        SELECT id, user_name, action, details, created_at
+        FROM activity_log ORDER BY created_at DESC LIMIT 200
+    """)
+    rows = dict_row(cur)
+    cur.close()
+    return jsonify(rows)
 
 
 # ── Metrics API ───────────────────────────────────────────────────────────────
