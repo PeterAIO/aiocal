@@ -922,6 +922,7 @@
                     </select>
                     <button type="button" class="btn btn-primary btn-sm" onclick="reassignBooking()" id="reassignBtn">Save</button>
                 </div></div>` : `<div class="field"><div class="field-label">Assigned To</div><div class="field-value">${b.user_name || 'Unassigned'}</div></div>`}
+                ${b.booking_type === 'demo_setup' ? `<div class="field"><div class="field-label">Demo Location</div><div class="field-value">${b.demo_location === 'offsite' ? 'Off-Site (no demo setup needed)' : 'San Jose Office'}</div></div>` : ''}
                 ${b.company_name ? `<div class="field"><div class="field-label">Company</div><div class="field-value">${b.company_name}</div></div>` : ''}
                 ${b.contact_name ? `<div class="field"><div class="field-label">Contact</div><div class="field-value">${b.contact_name}${b.contact_email ? ' - ' + b.contact_email : ''}${b.contact_phone ? ' - ' + b.contact_phone : ''}</div></div>` : ''}
                 ${b.address ? `<div class="field"><div class="field-label">Address</div><div class="field-value">${b.address}</div></div>` : ''}
@@ -949,7 +950,8 @@
                         hubspot_deal_id: b.hubspot_deal_id, hubspot_company_id: b.hubspot_company_id,
                         deal_stage: b.deal_stage, contact_name: b.contact_name,
                         contact_email: b.contact_email, contact_phone: b.contact_phone,
-                        address: b.address, notes: b.notes, status: b.status
+                        address: b.address, notes: b.notes, status: b.status,
+                        demo_location: b.demo_location
                     }),
                 });
                 if (res.ok) {
@@ -990,7 +992,8 @@
                     hubspot_deal_id: b.hubspot_deal_id, hubspot_company_id: b.hubspot_company_id,
                     deal_stage: b.deal_stage, contact_name: b.contact_name,
                     contact_email: b.contact_email, contact_phone: b.contact_phone,
-                    address: b.address, notes: b.notes, status: "cancelled"
+                    address: b.address, notes: b.notes, status: "cancelled",
+                    demo_location: b.demo_location
                 }),
             });
             if (res.ok) {

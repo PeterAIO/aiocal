@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -203,6 +203,14 @@ def init_db(conn):
     cur.execute("""
         DO $$ BEGIN
             ALTER TABLE bookings ADD COLUMN created_by TEXT REFERENCES users(id);
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$;
+    """)
+    # Demo bookings: 'office' (San Jose office demo space) or 'offsite'.
+    # NULL on demos booked before this column existed — those were all office demos.
+    cur.execute("""
+        DO $$ BEGIN
+            ALTER TABLE bookings ADD COLUMN demo_location TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$;
     """)
@@ -753,18 +761,35 @@ def _roles_for_booking_type(booking_type):
     return [["deployment_specialist", "installer", "trainer", "lead"]]
 
 
-# Demos share the office demo space, so demo start times must be at least this
-# far apart across ALL users, not just per assignee.
+# Where a demo happens. Office demos need a Demo Setup person to configure the
+# hardware and share the office demo space; off-site demos need neither.
+DEMO_LOCATIONS = ("office", "offsite")
+
+
+def demo_location(value):
+    """Normalise a demo location to 'office'/'offsite', or None if unset."""
+    return value if value in DEMO_LOCATIONS else None
+
+
+def is_offsite_demo(booking_type, value):
+    return booking_type == "demo_setup" and demo_location(value) == "offsite"
+
+
+# Office demos share the office demo space, so their start times must be at
+# least this far apart across ALL users, not just per assignee. Off-site demos
+# are exempt: they neither block office slots nor get blocked by them.
 DEMO_SPACING_HOURS = 2
 
 
 def _demo_starts_between(db, lo_dt, hi_dt, exclude_bid=None):
-    """Start datetimes of all non-cancelled demo bookings strictly inside
-    (lo_dt, hi_dt), any user."""
+    """Start datetimes of all non-cancelled OFFICE demo bookings strictly
+    inside (lo_dt, hi_dt), any user. NULL demo_location = a pre-column demo,
+    which was an office demo."""
     cur = db.cursor()
     query = """
         SELECT start_datetime FROM bookings
         WHERE booking_type = 'demo_setup' AND status != 'cancelled'
+          AND (demo_location IS NULL OR demo_location = 'office')
           AND start_datetime > %s AND start_datetime < %s
     """
     params = [lo_dt.isoformat(), hi_dt.isoformat()]
@@ -831,6 +856,10 @@ def _has_free_demo_hour(db, uid, dow, blocked_hours):
 def available_days():
     """Return which days of week (0=Mon..6=Sun) have at least one available user."""
     booking_type = request.args.get("booking_type", "install")
+    # Off-site demos are owned by whoever books them, so no one's availability
+    # limits which days can be picked.
+    if is_offsite_demo(booking_type, request.args.get("demo_location")):
+        return jsonify({"days": list(range(7))})
     db = get_db()
     roles = [r for tier in _roles_for_booking_type(booking_type) for r in tier]
     cur = db.cursor()
@@ -859,6 +888,23 @@ def round_robin():
     dow = target_date.weekday()  # Mon=0..Sun=6
 
     db = get_db()
+
+    # Off-site demos need no Demo Setup person, so they skip round robin and
+    # are owned by whoever is booking them.
+    if is_offsite_demo(booking_type, request.args.get("demo_location")):
+        booker = dict(g.current_user)
+        cur0 = db.cursor()
+        cur0.execute("""
+            SELECT start_time, end_time FROM availability
+            WHERE user_id = %s AND day_of_week = %s
+        """, (booker["id"], dow))
+        row = cur0.fetchone()
+        cur0.close()
+        booker["start_time"] = row[0] if row else "07:00"
+        booker["end_time"] = row[1] if row else "19:00"
+        booker["booked_hours"] = []
+        return jsonify({"user": booker})
+
     role_tiers = _roles_for_booking_type(booking_type)
     cur = db.cursor()
 
@@ -999,7 +1045,10 @@ def create_booking():
     bid = str(uuid.uuid4())
     db = get_db()
 
-    if data.get("booking_type") == "demo_setup":
+    btype_in = data.get("booking_type")
+    loc = (demo_location(data.get("demo_location")) or "office") if btype_in == "demo_setup" else None
+
+    if btype_in == "demo_setup" and loc == "office":
         conflict = demo_spacing_conflict(db, data["start_datetime"])
         if conflict:
             when = f"{conflict.strftime('%I:%M %p').lstrip('0')} on {conflict.strftime('%b %d')}"
@@ -1011,8 +1060,8 @@ def create_booking():
         (id, title, booking_type, start_datetime, end_datetime, user_id,
          company_name, hubspot_deal_id, hubspot_company_id, deal_stage,
          contact_name, contact_email, contact_phone, address, notes, status,
-         created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+         created_by, demo_location)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (bid, data["title"], data.get("booking_type", "install"),
          data["start_datetime"], data["end_datetime"], data["user_id"],
          data.get("company_name"), data.get("hubspot_deal_id"),
@@ -1020,7 +1069,7 @@ def create_booking():
          data.get("contact_name"), data.get("contact_email"),
          data.get("contact_phone"), data.get("address"),
          data.get("notes"), data.get("status", "confirmed"),
-         g.current_user["id"]),
+         g.current_user["id"], loc),
     )
     db.commit()
     cur.close()
@@ -1156,14 +1205,21 @@ def update_booking(bid):
     data = request.json
     db = get_db()
 
-    # Enforce demo spacing only when the start time (or type) actually changes,
-    # so reassigning/editing a pre-rule demo isn't blocked by its own history.
+    # Enforce demo spacing only when the start time, type or location actually
+    # changes, so reassigning/editing a pre-rule demo isn't blocked by its own
+    # history.
+    upd_loc = demo_location(data.get("demo_location"))  # None = leave as it is
     if data.get("booking_type") == "demo_setup" and data.get("status") != "cancelled":
         cur0 = db.cursor()
-        cur0.execute("SELECT start_datetime, booking_type FROM bookings WHERE id = %s", (bid,))
+        cur0.execute("SELECT start_datetime, booking_type, demo_location FROM bookings WHERE id = %s", (bid,))
         prev = cur0.fetchone()
         cur0.close()
-        if not prev or prev[0] != data["start_datetime"] or prev[1] != "demo_setup":
+        # Off-site demos don't share the office demo space, so they're exempt —
+        # but a demo moving off-site -> office has to claim an office slot.
+        prev_loc = (prev[2] if prev else None) or "office"
+        eff_loc = upd_loc or prev_loc
+        if eff_loc == "office" and (not prev or prev[0] != data["start_datetime"]
+                                    or prev[1] != "demo_setup" or prev_loc != "office"):
             conflict = demo_spacing_conflict(db, data["start_datetime"], exclude_bid=bid)
             if conflict:
                 when = f"{conflict.strftime('%I:%M %p').lstrip('0')} on {conflict.strftime('%b %d')}"
@@ -1174,7 +1230,8 @@ def update_booking(bid):
         """UPDATE bookings SET
         title=%s, booking_type=%s, start_datetime=%s, end_datetime=%s, user_id=%s,
         company_name=%s, hubspot_deal_id=%s, hubspot_company_id=%s, deal_stage=%s,
-        contact_name=%s, contact_email=%s, contact_phone=%s, address=%s, notes=%s, status=%s
+        contact_name=%s, contact_email=%s, contact_phone=%s, address=%s, notes=%s, status=%s,
+        demo_location=COALESCE(%s, demo_location)
         WHERE id=%s""",
         (data["title"], data.get("booking_type", "install"),
          data["start_datetime"], data["end_datetime"], data["user_id"],
@@ -1182,7 +1239,7 @@ def update_booking(bid):
          data.get("hubspot_company_id"), data.get("deal_stage"),
          data.get("contact_name"), data.get("contact_email"),
          data.get("contact_phone"), data.get("address"),
-         data.get("notes"), data.get("status", "confirmed"), bid),
+         data.get("notes"), data.get("status", "confirmed"), upd_loc, bid),
     )
     db.commit()
     cur.close()
@@ -1883,12 +1940,17 @@ def build_booking_html(booking_data, specialist_name, cancelled=False):
     status = "CANCELLED" if cancelled else "Confirmed"
     status_color = "#dc2626" if cancelled else "#16a34a"
     btype = booking_data.get("booking_type")
+    extra_rows = ""
     if btype == "onboarding":
         type_label = "Onboarding Call"
         assignee_label = "AIO Buddy"
     elif btype == "demo_setup":
         type_label = "Demo Setup Request"
-        assignee_label = "Demo Specialist"
+        offsite = demo_location(booking_data.get("demo_location")) == "offsite"
+        assignee_label = "Demo Owner" if offsite else "Demo Specialist"
+        extra_rows = ('<tr><td style="padding: 8px; font-weight: bold;">Demo Location:</td>'
+                      '<td style="padding: 8px;">%s</td></tr>'
+                      % ("Off-site (no office setup needed)" if offsite else "San Jose Office"))
     else:
         type_label = "Deployment"
         assignee_label = "Deployment Specialist"
@@ -1909,6 +1971,7 @@ def build_booking_html(booking_data, specialist_name, cancelled=False):
             <tr><td style="padding: 8px; font-weight: bold;">Contact Phone:</td><td style="padding: 8px;">{booking_data.get('contact_phone', 'N/A')}</td></tr>
             <tr style="background: #f9fafb;"><td style="padding: 8px; font-weight: bold;">Address:</td><td style="padding: 8px;">{booking_data.get('address', 'N/A')}</td></tr>
             <tr><td style="padding: 8px; font-weight: bold;">Notes:</td><td style="padding: 8px;">{booking_data.get('notes', 'N/A')}</td></tr>
+            {extra_rows}
         </table>
     </div>
     """, formatted_date, status

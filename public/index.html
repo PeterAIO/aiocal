@@ -305,6 +305,15 @@
                         </select>
                     </div>
 
+                    <div id="demoLocationWrap" class="hidden" style="margin:0 0 16px;">
+                        <label style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:6px;">Demo Location</label>
+                        <select id="demoLocationSelect" onchange="onDemoLocationChange()" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;font-family:inherit;background:#fff;">
+                            <option value="office">San Jose Office</option>
+                            <option value="offsite">Off-Site (no demo setup needed)</option>
+                        </select>
+                        <div style="font-size:12px;color:var(--text-muted);margin-top:6px;" id="demoLocationHint"></div>
+                    </div>
+
                     <div class="cal-header">
                         <button onclick="prevMonth()">&larr;</button>
                         <span class="month-title" id="monthTitle"></span>
@@ -472,6 +481,13 @@
             return el ? el.value : "install";
         }
 
+        // Demo location only applies to demo setup requests.
+        function currentDemoLocation() {
+            if (currentBookingType() !== "demo_setup") return null;
+            const el = document.getElementById("demoLocationSelect");
+            return el ? el.value : "office";
+        }
+
         // Format a Date object as YYYY-MM-DD using LOCAL components.
         // Avoids the toISOString() bug where eastern timezones (Pakistan UTC+5)
         // get the previous day because midnight-local converts back to UTC.
@@ -484,7 +500,10 @@
 
         async function loadAvailableDays() {
             try {
-                const res = await fetch("/api/available-days?booking_type=" + currentBookingType());
+                let url = "/api/available-days?booking_type=" + currentBookingType();
+                const loc = currentDemoLocation();
+                if (loc) url += "&demo_location=" + loc;
+                const res = await fetch(url);
                 const data = await res.json();
                 availableDays = data.days || [];
             } catch (e) {
@@ -503,6 +522,8 @@
             const labels = { onboarding: "Onboarding Call", demo_setup: "Demo Setup Request", install: "Deployment" };
             document.getElementById("bookingPanelTitle").textContent = titles[t] || titles.install;
             document.getElementById("bookingType").value = t;
+            document.getElementById("demoLocationWrap").classList.toggle("hidden", t !== "demo_setup");
+            updateDemoLocationHint();
             const badge = document.getElementById("step2TypeBadge");
             if (badge) {
                 badge.textContent = labels[t] || labels.install;
@@ -518,6 +539,20 @@
             // Reload availability and re-render
             await loadAvailableDays();
             renderCalendar();
+        }
+
+        // Changing the demo location changes who it's assigned to and whether the
+        // 2-hour office spacing rule applies, so redo the same reset as a type change.
+        async function onDemoLocationChange() {
+            await onBookingTypeChange();
+        }
+
+        function updateDemoLocationHint() {
+            const hint = document.getElementById("demoLocationHint");
+            if (!hint) return;
+            hint.textContent = currentDemoLocation() === "offsite"
+                ? "No demo setup person is assigned and the 2-hour spacing between office demos doesn't apply."
+                : "Needs the demo setup person and must start at least 2 hours from any other office demo.";
         }
 
         async function loadVersion() {
@@ -633,13 +668,16 @@
 
             // Call round-robin to assign a user for this date
             try {
-                const res = await fetch(`/api/round-robin?date=${dateStr}&booking_type=${currentBookingType()}`);
+                let rrUrl = `/api/round-robin?date=${dateStr}&booking_type=${currentBookingType()}`;
+                const demoLoc = currentDemoLocation();
+                if (demoLoc) rrUrl += `&demo_location=${demoLoc}`;
+                const res = await fetch(rrUrl);
                 const data = await res.json();
                 if (data.user) {
                     assignedUser = data.user;
                     document.getElementById("assignedUserInfo").innerHTML = `
                         <div class="assigned-info">
-                            <div class="assigned-label">Auto-Assigned To</div>
+                            <div class="assigned-label">${demoLoc === "offsite" ? "Owned By (Off-Site Demo)" : "Auto-Assigned To"}</div>
                             <div class="assigned-name">
                                 <span class="assigned-dot" style="background:${data.user.color || '#3788d8'}"></span>
                                 ${data.user.name}
@@ -773,8 +811,10 @@
             const endH = h + 1;
             const endLabel = endH > 12 ? `${endH-12}:00 PM` : endH === 12 ? '12:00 PM' : `${endH}:00 AM`;
             const slotLabel = isHourly ? `${timeLabel} – ${endLabel} (1 hour)` : `${timeLabel} (All day)`;
+            const locLabel = currentDemoLocation() === "office" ? " | San Jose Office"
+                : currentDemoLocation() === "offsite" ? " | Off-Site" : "";
             document.getElementById("step2Summary").textContent =
-                `${d.toLocaleDateString('en-GB', opts)} | Start: ${slotLabel}`;
+                `${d.toLocaleDateString('en-GB', opts)} | Start: ${slotLabel}${locLabel}`;
 
             document.getElementById("bookingUser").value = assignedUser.id;
             document.getElementById("step2AssignedName").innerHTML =
@@ -870,6 +910,8 @@
                 address: document.getElementById("bookingAddress").value,
                 notes: document.getElementById("bookingNotes").value,
             };
+            const demoLoc = currentDemoLocation();
+            if (demoLoc) data.demo_location = demoLoc;
 
             if (!data.title) data.title = "Deployment";
             if (!data.user_id) {
