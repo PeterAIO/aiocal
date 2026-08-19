@@ -898,7 +898,12 @@
                 goToStep1();
                 selectDate(dateStr);
             } else {
-                alert("Failed to save booking.");
+                let errMsg = "Failed to save booking.";
+                try {
+                    const err = await res.json();
+                    if (err.error) errMsg = err.error;
+                } catch (e) {}
+                alert(errMsg);
             }
         }
 

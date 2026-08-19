@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.18.0"
+VERSION = "2.19.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -753,38 +753,77 @@ def _roles_for_booking_type(booking_type):
     return [["deployment_specialist", "installer", "trainer", "lead"]]
 
 
-def _has_free_demo_hour(db, uid, dow, date_str, next_date):
-    """True if the user has at least one unbooked 1-hour demo slot left in
-    their availability window on this date (mirrors the slot list the
-    frontend builds)."""
+# Demos share the office demo space, so demo start times must be at least this
+# far apart across ALL users, not just per assignee.
+DEMO_SPACING_HOURS = 2
+
+
+def _demo_starts_between(db, lo_dt, hi_dt, exclude_bid=None):
+    """Start datetimes of all non-cancelled demo bookings strictly inside
+    (lo_dt, hi_dt), any user."""
+    cur = db.cursor()
+    query = """
+        SELECT start_datetime FROM bookings
+        WHERE booking_type = 'demo_setup' AND status != 'cancelled'
+          AND start_datetime > %s AND start_datetime < %s
+    """
+    params = [lo_dt.isoformat(), hi_dt.isoformat()]
+    if exclude_bid:
+        query += " AND id != %s"
+        params.append(exclude_bid)
+    cur.execute(query, params)
+    starts = []
+    for r in cur.fetchall():
+        try:
+            starts.append(r[0] if isinstance(r[0], datetime) else datetime.fromisoformat(str(r[0])))
+        except Exception:
+            pass
+    cur.close()
+    return starts
+
+
+def demo_spacing_conflict(db, start_iso, exclude_bid=None):
+    """Return the start datetime of another demo booked within
+    DEMO_SPACING_HOURS of start_iso, else None. Exactly 2 hours apart is
+    allowed."""
+    try:
+        start = datetime.fromisoformat(start_iso)
+    except Exception:
+        return None
+    window = timedelta(hours=DEMO_SPACING_HOURS)
+    starts = _demo_starts_between(db, start - window, start + window, exclude_bid)
+    return min(starts) if starts else None
+
+
+def _demo_blocked_hours(db, target_date):
+    """Hours (0-23) on target_date where a demo start would violate the
+    spacing rule (includes the hours of the existing demos themselves)."""
+    window = timedelta(hours=DEMO_SPACING_HOURS)
+    starts = _demo_starts_between(db, target_date - window, target_date + timedelta(days=1) + window)
+    secs = window.total_seconds()
+    return {h for h in range(24)
+            if any(abs(((target_date + timedelta(hours=h)) - s).total_seconds()) < secs for s in starts)}
+
+
+def _has_free_demo_hour(db, uid, dow, blocked_hours):
+    """True if the user has at least one 1-hour demo slot left in their
+    availability window that the spacing rule doesn't block (mirrors the slot
+    list the frontend builds)."""
     cur = db.cursor()
     cur.execute("""
         SELECT start_time, end_time FROM availability
         WHERE user_id = %s AND day_of_week = %s
     """, (uid, dow))
     row = cur.fetchone()
+    cur.close()
     if not row:
-        cur.close()
         return False
     try:
         start_h = int(str(row[0]).split(":")[0])
         end_h = int(str(row[1]).split(":")[0])
     except Exception:
         start_h, end_h = 7, 19
-    cur.execute("""
-        SELECT start_datetime FROM bookings
-        WHERE user_id = %s AND start_datetime >= %s AND start_datetime < %s
-          AND status != 'cancelled' AND booking_type = 'demo_setup'
-    """, (uid, date_str, next_date))
-    booked = set()
-    for r in cur.fetchall():
-        try:
-            sdt = r[0] if isinstance(r[0], datetime) else datetime.fromisoformat(str(r[0]))
-            booked.add(sdt.hour)
-        except Exception:
-            pass
-    cur.close()
-    return any(h not in booked for h in range(start_h, end_h))
+    return any(h not in blocked_hours for h in range(start_h, end_h))
 
 
 @app.route("/api/available-days")
@@ -832,6 +871,9 @@ def round_robin():
 
     next_date = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Hours ruled out by the global demo spacing rule (empty for other types)
+    demo_blocked = _demo_blocked_hours(db, target_date) if booking_type == "demo_setup" else set()
+
     # Try each role tier in order (demos fall back to the deployment team
     # when the Demo Setup person is unavailable).
     available_users = []
@@ -857,7 +899,7 @@ def round_robin():
             candidates = [u for u in candidates if u["id"] not in booked_ids]
         elif booking_type == "demo_setup":
             # A candidate whose slots are all taken counts as unavailable
-            candidates = [u for u in candidates if _has_free_demo_hour(db, u["id"], dow, date_str, next_date)]
+            candidates = [u for u in candidates if _has_free_demo_hour(db, u["id"], dow, demo_blocked)]
 
         if candidates:
             available_users = candidates
@@ -895,10 +937,13 @@ def round_robin():
         chosen["start_time"] = avail_row[0]
         chosen["end_time"] = avail_row[1]
 
-    # For 1-hour slot bookings (onboarding, demo_setup), return the chosen user's
-    # already-booked hours so the frontend can disable those slots.
+    # For 1-hour slot bookings (onboarding, demo_setup), return the hours the
+    # frontend should disable. Demos use the global spacing rule; onboarding
+    # stays per-user.
     booked_hours = []
-    if booking_type in ("onboarding", "demo_setup"):
+    if booking_type == "demo_setup":
+        booked_hours = sorted(demo_blocked)
+    elif booking_type == "onboarding":
         cur3 = db.cursor()
         cur3.execute("""
             SELECT start_datetime FROM bookings
@@ -953,6 +998,13 @@ def create_booking():
     data = request.json
     bid = str(uuid.uuid4())
     db = get_db()
+
+    if data.get("booking_type") == "demo_setup":
+        conflict = demo_spacing_conflict(db, data["start_datetime"])
+        if conflict:
+            when = f"{conflict.strftime('%I:%M %p').lstrip('0')} on {conflict.strftime('%b %d')}"
+            return jsonify({"error": f"Demos must be booked at least {DEMO_SPACING_HOURS} hours apart. Another demo is already booked at {when}."}), 409
+
     cur = db.cursor()
     cur.execute(
         """INSERT INTO bookings
@@ -1103,6 +1155,20 @@ def update_booking(bid):
         return err
     data = request.json
     db = get_db()
+
+    # Enforce demo spacing only when the start time (or type) actually changes,
+    # so reassigning/editing a pre-rule demo isn't blocked by its own history.
+    if data.get("booking_type") == "demo_setup" and data.get("status") != "cancelled":
+        cur0 = db.cursor()
+        cur0.execute("SELECT start_datetime, booking_type FROM bookings WHERE id = %s", (bid,))
+        prev = cur0.fetchone()
+        cur0.close()
+        if not prev or prev[0] != data["start_datetime"] or prev[1] != "demo_setup":
+            conflict = demo_spacing_conflict(db, data["start_datetime"], exclude_bid=bid)
+            if conflict:
+                when = f"{conflict.strftime('%I:%M %p').lstrip('0')} on {conflict.strftime('%b %d')}"
+                return jsonify({"error": f"Demos must be booked at least {DEMO_SPACING_HOURS} hours apart. Another demo is already booked at {when}."}), 409
+
     cur = db.cursor()
     cur.execute(
         """UPDATE bookings SET
