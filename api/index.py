@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify, g
 
-VERSION = "2.20.0"
+VERSION = "2.21.0"
 
 
 def local_dt_to_ms(dt_naive):
@@ -213,6 +213,37 @@ def init_db(conn):
             ALTER TABLE bookings ADD COLUMN demo_location TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$;
+    """)
+    # The 'demo' role is dead — it went away in v2.14.0 along with the hardcoded
+    # demo-user pin that force-set it. Any write of it now means a pre-2.14 copy
+    # of this app is still connected to this database. Suppress the change
+    # instead of raising (the stale caller keeps working, it just can't knock the
+    # OB admin out of their role any more) and log the attempt with the client IP
+    # so the source can be identified from the Activity tab.
+    cur.execute("""
+        CREATE OR REPLACE FUNCTION block_dead_demo_role() RETURNS trigger AS $fn$
+        BEGIN
+            IF NEW.role = 'demo' AND OLD.role IS DISTINCT FROM 'demo' THEN
+                INSERT INTO activity_log (id, user_id, user_name, action, details)
+                VALUES (
+                    gen_random_uuid()::text, OLD.id, OLD.name,
+                    'blocked_demo_role_write',
+                    format('kept role=%s; client=%s; app=%s',
+                           OLD.role,
+                           coalesce(host(inet_client_addr()), 'local'),
+                           coalesce(nullif(current_setting('application_name', true), ''), 'unknown'))
+                );
+                NEW.role := OLD.role;
+            END IF;
+            RETURN NEW;
+        END
+        $fn$ LANGUAGE plpgsql;
+    """)
+    cur.execute("DROP TRIGGER IF EXISTS trg_block_dead_demo_role ON users;")
+    cur.execute("""
+        CREATE TRIGGER trg_block_dead_demo_role
+        BEFORE UPDATE OF role ON users
+        FOR EACH ROW EXECUTE FUNCTION block_dead_demo_role();
     """)
     conn.commit()
     cur.close()
@@ -751,8 +782,10 @@ def _roles_for_booking_type(booking_type):
     """Map booking type to role tiers, tried in order until one has an
     available user."""
     # OB calls funnel to the OB admin, who then reassigns them to an AIO buddy.
+    # If there is no available OB admin at all, fall back to the AIO buddies
+    # directly rather than leaving OB calls unbookable.
     if booking_type == "onboarding":
-        return [["ob_admin"]]
+        return [["ob_admin"], ["aio_buddy"]]
     # Demos go to the dedicated Demo Setup person; if they're unavailable,
     # fall back to the deployment team.
     if booking_type == "demo_setup":

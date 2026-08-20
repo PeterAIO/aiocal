@@ -115,6 +115,14 @@
         // Changelog — newest first. Update this list with each release.
         const CHANGELOG = [
             {
+                version: "2.21.0",
+                date: "2026-08-20",
+                changes: [
+                    { tag: "fix", text: "Team members can no longer be silently moved to the retired \"demo\" role. That role was removed in v2.14.0, but something still running the old code was flipping the OB Admin into it, which left Onboarding Calls with nobody to assign them to. Any further attempt is now blocked at the database and shows up in the Activity tab as \"blocked_demo_role_write\", along with where it came from." },
+                    { tag: "fix", text: "Onboarding Calls no longer become unbookable when no OB Admin is available. If the OB Admin is on time off, has no availability that day, or their role has been changed, the call now falls back to the AIO Buddies instead of showing no available days." },
+                ],
+            },
+            {
                 version: "2.20.0",
                 date: "2026-08-19",
                 changes: [
