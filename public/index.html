@@ -293,18 +293,17 @@
         <div id="step1">
             <div class="booking-card">
                 <div class="cal-panel">
-                    <h2 id="bookingPanelTitle">Book a Deployment</h2>
+                    <h2 id="bookingPanelTitle">Book a Demo Setup Request</h2>
                     <div class="cal-subtitle">Select a date to see available times</div>
 
                     <div style="margin:12px 0 16px;">
                         <label style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:6px;">Booking Type</label>
                         <select id="bookingTypeSelect" onchange="onBookingTypeChange()" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;font-family:inherit;background:#fff;">
-                            <option value="install">Deployment</option>
                             <option value="demo_setup">Demo Setup Request</option>
                         </select>
                     </div>
 
-                    <div id="demoLocationWrap" class="hidden" style="margin:0 0 16px;">
+                    <div id="demoLocationWrap" style="margin:0 0 16px;">
                         <label style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:6px;">Demo Location</label>
                         <select id="demoLocationSelect" onchange="onDemoLocationChange()" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;font-family:inherit;background:#fff;">
                             <option value="office">San Jose Office</option>
@@ -369,8 +368,8 @@
                     </div>
 
                     <input type="hidden" id="bookingTitle">
-                    <input type="hidden" id="bookingType" value="install">
-                    <div id="step2TypeBadge" style="display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600;margin-bottom:14px;background:#dbeafe;color:#1d4ed8;">Deployment</div>
+                    <input type="hidden" id="bookingType" value="demo_setup">
+                    <div id="step2TypeBadge" style="display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600;margin-bottom:14px;background:#fef3c7;color:#92400e;">Demo Setup Request</div>
 
                     <input type="hidden" id="bookingUser">
                     <div id="step2AssignedInfo" class="assigned-info" style="margin-bottom:14px;">
@@ -466,6 +465,7 @@
 
             await Promise.all([loadUsers(), loadAvailableDays()]);
             renderCalendar();
+            updateDemoLocationHint();
             loadDeals();
             loadVersion();
         });
@@ -477,7 +477,7 @@
 
         function currentBookingType() {
             const el = document.getElementById("bookingTypeSelect");
-            return el ? el.value : "install";
+            return el ? el.value : "demo_setup";
         }
 
         // Demo location only applies to demo setup requests.
